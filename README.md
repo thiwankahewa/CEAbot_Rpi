@@ -1,71 +1,102 @@
-# Gemini 336 capture over the Gen3 expansion Ethernet
+# Gemini 336 capture spool over the Gen3 expansion Ethernet
 
-The Raspberry Pi runs the Orbbec ROS 2 driver and
-`rpi_orbbec_capture_server.py`. The Jetson runs
-`arm_controlling remote_orbbec_capture`, which preserves the existing
-`/orbbec_test_scan/capture_view` service used by `plant_view_scanner`.
+The Pi captures and compresses every view locally. It does **not** transfer a
+view during the scan. After `/individual_scan_done` is published, the Jetson
+downloads all pending archives in resumable chunks and installs them in the
+original scan folders. The next capture automatically pauses transfer; the next
+row-complete signal resumes it.
+
+Each installed view contains:
+
+```text
+<run_dir>/plant_<ID>/<view>/
+├── color.png
+├── depth.npy
+├── cloud_xyzrgb.npy
+└── meta.yaml
+```
+
+`depth.npy` preserves the original `uint16` depth values. The canonical point
+cloud is `cloud_xyzrgb.npy`; create a PLY later only when an external viewer
+needs one, avoiding duplicate storage and transfer during acquisition.
 
 ## Raspberry Pi
 
-Configure `eth0` as `10.20.0.200/24`, install the Orbbec ROS 2 wrapper,
-`cv_bridge`, `message_filters`, OpenCV and PyYAML, then start the camera without
-point-cloud publishing. Use the same camera settings currently found in
-`bench_robot/launch/robot.launch.py`.
+Use Ubuntu Server ARM64 and synchronize the Pi and Jetson clocks with
+chrony/NTP. Configure `eth0` as `10.20.0.200/24` and install the Orbbec ROS 2
+wrapper, `cv_bridge`, `message_filters`, OpenCV, NumPy and PyYAML.
 
-Synchronize the Pi and Jetson clocks with chrony/NTP. The Jetson uses the
-depth-image timestamp to look up the arm transform, so unsynchronized clocks
-will produce missing or incorrect capture poses.
+The registered colored point-cloud topic is required:
+
+```bash
+source /opt/ros/$ROS_DISTRO/setup.bash
+source ~/orbbec_ws/install/setup.bash
+
+ros2 launch orbbec_camera gemini_330_series.launch.py \
+  camera_name:=gemini336 \
+  depth_registration:=true \
+  align_mode:=SW \
+  enable_point_cloud:=false \
+  enable_colored_point_cloud:=true
+```
+
+Create a writable spool directory. An NVMe SSD is strongly preferred because
+RGB-D point-cloud archives are large:
+
+```bash
+sudo mkdir -p /var/lib/ceabot-captures
+sudo chown "$USER":"$USER" /var/lib/ceabot-captures
+```
+
+Start the server:
 
 ```bash
 export CEABOT_CAPTURE_TOKEN='replace-with-a-long-random-token'
-source /opt/ros/$ROS_DISTRO/setup.bash
-source ~/orbbec_ws/install/setup.bash
-ros2 launch orbbec_camera gemini_330_series.launch.py \
-  camera_name:=gemini336 depth_registration:=true align_mode:=SW \
-  enable_point_cloud:=false enable_colored_point_cloud:=false
+python3 /home/thiwa/CEAbot_Rpi/rpi_orbbec_capture_server.py \
+  --bind 10.20.0.200 \
+  --spool-dir /var/lib/ceabot-captures \
+  --depth-scale-m-per-unit 0.001
 ```
 
-In a second terminal:
+Health check from the Jetson:
 
 ```bash
-export CEABOT_CAPTURE_TOKEN='replace-with-the-same-token'
-source /opt/ros/$ROS_DISTRO/setup.bash
-source ~/orbbec_ws/install/setup.bash
-python3 rpi_orbbec_capture_server.py --bind 10.20.0.200
-```
-
-Test from the Jetson:
-
-```bash
-curl http://10.20.0.200:8080/health
+curl -H "Authorization: Bearer $CEABOT_CAPTURE_TOKEN" \
+  http://10.20.0.200:8080/health
 ```
 
 ## Jetson
 
-Build and source the CEAbot workspace, then run the proxy instead of
-`bench_robot/orbbec_test_scan`:
+Disable the Jetson-side Gemini 336 launch and the old `orbbec_test_scan` node.
+Build and run the proxy:
 
 ```bash
+cd /home/thiwa/CEAbot
 colcon build --packages-select arm_controlling
 source install/setup.bash
+
+export CEABOT_CAPTURE_TOKEN='replace-with-the-same-token'
 ros2 run arm_controlling remote_orbbec_capture --ros-args \
   -p rpi_url:=http://10.20.0.200:8080 \
-  -p auth_token:="$CEABOT_CAPTURE_TOKEN"
+  -p auth_token:="$CEABOT_CAPTURE_TOKEN" \
+  -p chunk_bytes:=1048576
 ```
 
-The proxy saves each response to:
+`plant_view_scanner` continues using `/orbbec_test_scan/capture_view`. A capture
+returns after the Pi has safely written its compressed archive. The Jetson
+creates `meta.yaml` immediately so timestamped TF/pose metadata can still be
+recorded; it merges that metadata when the full archive arrives.
 
-```text
-<run_dir>/plant_<ID>/<view_label>/color.png
-<run_dir>/plant_<ID>/<view_label>/depth.png
-<run_dir>/plant_<ID>/<view_label>/meta.yaml
+The proxy automatically starts/resumes transfer when it receives
+`/individual_scan_done`. Manual controls are also available:
+
+```bash
+ros2 service call /remote_orbbec_transfer/start std_srvs/srv/Trigger '{}'
+ros2 service call /remote_orbbec_transfer/pause std_srvs/srv/Trigger '{}'
+ros2 service call /remote_orbbec_transfer/status std_srvs/srv/Trigger '{}'
 ```
 
-`depth.png` is lossless 16-bit depth. `meta.yaml` is installed last and is the
-completion marker used by `plant_view_scanner`.
-
-Disable both the Gemini 336 launch and `orbbec_test_scan` on the Jetson; those
-now run on, or are replaced by, the Pi and the remote proxy. Existing
-point-cloud reconstruction code will also need a separate RGB-D back-projection
-update because this transport deliberately does not create `cloud.ply` or
-`cloud_xyzrgb.npy`.
+Pi archives are deleted only after the Jetson verifies the complete archive,
+extracts all files, merges metadata and acknowledges successful installation.
+If the connection fails, the partial archive remains on both machines and the
+next start/row-complete command resumes it.
