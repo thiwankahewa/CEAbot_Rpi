@@ -118,11 +118,25 @@ curl http://10.20.0.200:8080/health
 
 7. Restart after editing a service
 ----------------------------------
+After changing either service file in this repository, install the edited file,
+reload systemd, restart the service, and check its logs.
+
+For the Gemini camera service:
+
+cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
 sudo cp orbbec-camera.service /etc/systemd/system/
-sudo cp ceabot-capture.service /etc/systemd/system/
+sudo chmod 644 /etc/systemd/system/orbbec-camera.service
 sudo systemctl daemon-reload
 sudo systemctl restart orbbec-camera.service
+journalctl -u orbbec-camera.service -f
+
+For the capture server service:
+
+sudo cp ceabot-capture.service /etc/systemd/system/
+sudo chmod 644 /etc/systemd/system/ceabot-capture.service
+sudo systemctl daemon-reload
 sudo systemctl restart ceabot-capture.service
+journalctl -u ceabot-capture.service -f
 
 8. Disable the automatic services if needed
 --------------------------------------------
