@@ -26,6 +26,124 @@ Use Ubuntu Server ARM64 and synchronize the Pi and Jetson clocks with
 chrony/NTP. Configure `eth0` as `10.20.0.200/24` and install the Orbbec ROS 2
 wrapper, `cv_bridge`, `message_filters`, OpenCV, NumPy and PyYAML.
 
+## Verified physical wiring
+
+The installed 20-pin FFC reverses its pin order:
+
+```text
+Kinova pin 1  -> breakout pin 20
+Kinova pin 20 -> breakout pin 1
+breakout pin = 21 - Kinova pin
+```
+
+For a T568B Ethernet cable whose RJ45 end plugs into the Raspberry Pi:
+
+| RJ45 pin | Cable color | Kinova signal | Kinova pin | Breakout pin |
+|---:|---|---|---:|---:|
+| 1 | white/orange | ETH_RX_P | 5 | 16 |
+| 2 | orange | ETH_RX_N | 6 | 15 |
+| 3 | white/green | ETH_TX_P | 8 | 13 |
+| 6 | green | ETH_TX_N | 9 | 12 |
+
+The blue and brown pairs are unused and individually insulated. The Pi is
+powered independently; Kinova +24 V is not connected to it. Before reconnecting
+after any wiring work, verify the mapping and absence of shorts with power off.
+
+The working link reports:
+
+```text
+Speed: 100Mb/s
+Duplex: Full
+Auto-negotiation: off
+Link detected: yes
+```
+
+The Kinova Web App expansion connection is configured for 100 Mbps/full duplex,
+so the Pi is intentionally forced to the matching mode.
+
+## Verified network topology
+
+```text
+Jetson:          192.168.1.2   (enP1p1s0)
+Kinova external: 192.168.1.10
+Kinova EXP:      10.20.0.1
+Raspberry Pi:    10.20.0.200   (eth0)
+```
+
+Temporary commands used during commissioning were:
+
+```bash
+# Raspberry Pi
+sudo ethtool -s eth0 speed 100 duplex full autoneg off
+sudo ip address replace 10.20.0.200/24 dev eth0
+sudo ip link set eth0 up
+sudo ip route replace 192.168.1.0/24 via 10.20.0.1 dev eth0
+
+# Jetson
+sudo ip route replace 10.20.0.0/24 via 192.168.1.10 dev enP1p1s0
+```
+
+Successful commissioning checks were:
+
+```bash
+# Pi -> Kinova EXP
+ping -I eth0 -c 4 10.20.0.1
+
+# Jetson -> Pi through Kinova
+ping -c 4 10.20.0.200
+```
+
+Both achieved 0% packet loss. These `ip` and `ethtool` commands are temporary;
+install the boot services below to restore them automatically after reboot.
+
+## Make both ends persistent across reboot
+
+On the Raspberry Pi:
+
+```bash
+cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
+sudo cp ceabot-expansion-network.service /etc/systemd/system/
+sudo cp orbbec-camera.service /etc/systemd/system/
+sudo cp ceabot-capture.service /etc/systemd/system/
+
+sudo mkdir -p /var/lib/ceabot-captures
+sudo chown thiwa:thiwa /var/lib/ceabot-captures
+sudo chmod 750 /var/lib/ceabot-captures
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now ceabot-expansion-network.service
+sudo systemctl enable --now orbbec-camera.service
+sudo systemctl enable --now ceabot-capture.service
+```
+
+On the Jetson:
+
+```bash
+cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
+sudo cp jetson-ceabot-rpi-route.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now jetson-ceabot-rpi-route.service
+```
+
+After rebooting both machines, verify:
+
+```bash
+# Pi
+ip -br address show eth0
+sudo ethtool eth0 | grep -E "Speed|Duplex|Auto-negotiation|Link detected"
+systemctl --no-pager --full status ceabot-expansion-network orbbec-camera ceabot-capture
+
+# Jetson
+ip route get 10.20.0.200
+ping -c 4 10.20.0.200
+curl -H "Authorization: Bearer $CEABOT_CAPTURE_TOKEN" \
+  http://10.20.0.200:8080/health
+```
+
+The expected health response has `ok: true`. A positive `frames_received`
+value confirms the Orbbec driver is publishing synchronized RGB, depth and
+registered colored point-cloud messages.
+
 The registered colored point-cloud topic is required:
 
 ```bash

@@ -18,8 +18,10 @@ Assumptions
 
 Files included in this folder
 -----------------------------
+- ceabot-expansion-network.service
 - orbbec-camera.service
 - ceabot-capture.service
+- jetson-ceabot-rpi-route.service (install this one on the Jetson)
 - ceabot-capture.env.example
 - ros_jazzy.bash
 - REINSTALL_INSTRUCTIONS.txt
@@ -55,8 +57,10 @@ ros2 launch orbbec_camera gemini_330_series.launch.py --show-args
 2. Copy the service files
 -------------------------
 cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
+sudo cp ceabot-expansion-network.service /etc/systemd/system/
 sudo cp orbbec-camera.service /etc/systemd/system/
 sudo cp ceabot-capture.service /etc/systemd/system/
+sudo chmod 644 /etc/systemd/system/ceabot-expansion-network.service
 sudo chmod 644 /etc/systemd/system/orbbec-camera.service
 sudo chmod 644 /etc/systemd/system/ceabot-capture.service
 
@@ -85,10 +89,19 @@ sudo chmod 600 /etc/ceabot-capture.env
 Configure the Jetson to use exactly the same token. The example file in this
 folder intentionally does not contain the real secret.
 
-4. Configure the Ethernet address
----------------------------------
-The capture server binds to 10.20.0.200. Confirm that this address is assigned
-to eth0 before expecting the server to start:
+4. Configure the Ethernet address and routes
+--------------------------------------------
+The ceabot-expansion-network service forces eth0 to 100 Mbps/full duplex,
+assigns 10.20.0.200/24, and installs the return route through 10.20.0.1.
+Install the Jetson route service separately on the Jetson:
+
+cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
+sudo cp jetson-ceabot-rpi-route.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now jetson-ceabot-rpi-route.service
+
+On the Pi, confirm that the expansion address is assigned before expecting the
+capture server to start:
 
 ip -brief address show eth0
 
@@ -101,6 +114,7 @@ For testing on all configured network interfaces, --bind may be changed to
 5. Enable and start both services
 ---------------------------------
 sudo systemctl daemon-reload
+sudo systemctl enable --now ceabot-expansion-network.service
 sudo systemctl enable --now orbbec-camera.service
 sudo systemctl enable --now ceabot-capture.service
 
