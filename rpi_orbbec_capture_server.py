@@ -8,6 +8,7 @@ import json
 import os
 import platform
 import re
+import signal
 import socket
 import tarfile
 import tempfile
@@ -25,6 +26,7 @@ import yaml
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
+from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -316,17 +318,36 @@ def parse_args():
 def main():
     args = parse_args(); os.makedirs(args.spool_dir, exist_ok=True); rclpy.init()
     source = OrbbecFrameSource(args.camera_name)
-    ros_thread = threading.Thread(target=rclpy.spin, args=(source,), daemon=True); ros_thread.start()
+    def spin_ros():
+        try:
+            rclpy.spin(source)
+        except ExternalShutdownException:
+            pass
+
+    ros_thread = threading.Thread(target=spin_ros, daemon=True); ros_thread.start()
     server = ThreadingHTTPServer((args.bind, args.port), CaptureHandler)
     server.frame_source, server.capture_timeout = source, args.capture_timeout
     server.capture_lock = threading.Lock()
     server.depth_scale_m, server.spool_dir = args.depth_scale_m_per_unit, os.path.abspath(args.spool_dir)
     server.auth_token = args.token
     source.get_logger().info(f"Listening on http://{args.bind}:{args.port}; spool={server.spool_dir}")
+    stop_requested = threading.Event()
+
+    def request_stop(signum, frame):
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    signal.signal(signal.SIGINT, request_stop)
+    server.timeout = 0.5
     try:
-        server.serve_forever()
+        while not stop_requested.is_set():
+            server.handle_request()
     finally:
-        server.server_close(); source.destroy_node(); rclpy.shutdown(); ros_thread.join(timeout=2.0)
+        server.server_close()
+        if rclpy.ok():
+            rclpy.shutdown()
+        ros_thread.join(timeout=2.0)
+        source.destroy_node()
 
 
 if __name__ == "__main__":
