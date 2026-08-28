@@ -3,7 +3,7 @@ CEABOT RASPBERRY PI BOOT SERVICES - REINSTALL INSTRUCTIONS
 
 Purpose
 -------
-These services start the Orbbec Gemini 330 ROS 2 driver and the CEAbot HTTP
+These services start the Orbbec Gemini 305 ROS 2 driver and the CEAbot HTTP
 capture server automatically at boot. A desktop session or automatic user
 login is not required.
 
@@ -14,7 +14,8 @@ Assumptions
 - Project: /home/thiwa/CEAbot_Rpi
 - Capture server: /home/thiwa/CEAbot_Rpi/rpi_orbbec_capture_server.py
 - Pi Ethernet address: 10.20.0.200
-- Orbbec ROS package and Gemini 330 launch file are installed.
+- Orbbec ROS wrapper/SDK 2.8.6 or newer is installed from v2-main.
+- Gemini 305 firmware 1.0.70 is used with gemini_301_series.launch.py.
 
 Files included in this folder
 -----------------------------
@@ -48,14 +49,60 @@ ROS commands will then be available automatically in every newly opened Bash
 terminal. This shell setup is for interactive terminals; the systemd service
 files source ROS independently and do not depend on ~/.bashrc.
 
-1. Verify ROS and the camera launch file
+1. Install or upgrade the Orbbec SDK for Gemini 305
+---------------------------------------------------
+Gemini 305 firmware 1.0.70 requires wrapper/SDK 2.8.6 or newer. Stop the
+services and disconnect the camera before building:
+
+sudo systemctl stop ceabot-capture.service orbbec-camera.service
+pkill -f component_container || true
+
+When upgrading the old 2.7.6 workspace, retain it as a backup:
+
+cd /home/thiwa
+mv orbbec_ws orbbec_ws_2_7_6_backup
+mkdir -p orbbec_ws/src
+
+source /opt/ros/jazzy/setup.bash
+sudo apt update
+sudo apt install -y git libgflags-dev nlohmann-json3-dev libdw-dev libssl-dev \
+  mesa-utils libgl1 libgoogle-glog-dev ros-jazzy-image-transport \
+  ros-jazzy-image-transport-plugins ros-jazzy-compressed-image-transport \
+  ros-jazzy-image-publisher ros-jazzy-camera-info-manager \
+  ros-jazzy-diagnostic-updater ros-jazzy-diagnostic-msgs \
+  ros-jazzy-statistics-msgs ros-jazzy-xacro ros-jazzy-backward-ros
+
+cd /home/thiwa/orbbec_ws/src
+git clone --branch v2-main --single-branch \
+  https://github.com/orbbec/OrbbecSDK_ROS2.git
+cd /home/thiwa/orbbec_ws
+colcon build --event-handlers console_direct+ \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+cd /home/thiwa/orbbec_ws/src/OrbbecSDK_ROS2/orbbec_camera/scripts
+sudo bash install_udev_rules.sh
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+
+Power-cycle the Pi and camera after installing the rules.
+
+2. Verify ROS and the camera launch file
 ----------------------------------------
 source /opt/ros/jazzy/setup.bash
+source /home/thiwa/orbbec_ws/install/setup.bash
 ros2 pkg prefix orbbec_camera
-ros2 launch orbbec_camera gemini_330_series.launch.py --show-args
+ros2 pkg xml orbbec_camera | grep '<version>'
+ros2 run orbbec_camera list_devices_node
+ros2 launch orbbec_camera gemini_301_series.launch.py --show-args
 
-2. Copy the service files
+3. Copy the service files
 -------------------------
+Stop the dependent services before replacing their unit files:
+
+sudo systemctl stop ceabot-capture.service
+sudo systemctl stop orbbec-camera.service
+sudo systemctl stop ceabot-expansion-network.service
+
 cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
 sudo cp ceabot-expansion-network.service /etc/systemd/system/
 sudo cp orbbec-camera.service /etc/systemd/system/
@@ -67,7 +114,7 @@ sudo chmod 644 /etc/systemd/system/ceabot-capture.service
 Do not copy files directly into multi-user.target.wants. The systemctl enable
 command below creates the correct symbolic links there.
 
-3. Create the private authentication-token file
+4. Create the private authentication-token file
 ------------------------------------------------
 Generate a token:
 
@@ -89,7 +136,7 @@ sudo chmod 600 /etc/ceabot-capture.env
 Configure the Jetson to use exactly the same token. The example file in this
 folder intentionally does not contain the real secret.
 
-4. Configure the Ethernet address and routes
+5. Configure the Ethernet address and routes
 --------------------------------------------
 The ceabot-expansion-network service forces eth0 to 100 Mbps/full duplex,
 assigns 10.20.0.200/24, and installs the return route through 10.20.0.1.
@@ -111,14 +158,16 @@ value after --bind before copying it into /etc/systemd/system.
 For testing on all configured network interfaces, --bind may be changed to
 0.0.0.0. Keep the firewall and bearer-token security in mind when doing this.
 
-5. Enable and start both services
+6. Enable and start all services
 ---------------------------------
 sudo systemctl daemon-reload
+sudo systemctl reset-failed ceabot-expansion-network.service orbbec-camera.service ceabot-capture.service
 sudo systemctl enable --now ceabot-expansion-network.service
-sudo systemctl enable --now orbbec-camera.service
-sudo systemctl enable --now ceabot-capture.service
+sudo systemctl enable orbbec-camera.service ceabot-capture.service
+sudo systemctl start orbbec-camera.service
+sudo systemctl start ceabot-capture.service
 
-6. Check status and logs
+7. Check status and logs
 ------------------------
 systemctl status orbbec-camera.service
 systemctl status ceabot-capture.service
@@ -130,29 +179,33 @@ Test the HTTP server locally:
 
 curl http://10.20.0.200:8080/health
 
-7. Restart after editing a service
+8. Restart after editing a service
 ----------------------------------
-After changing either service file in this repository, install the edited file,
-reload systemd, restart the service, and check its logs.
+After changing a service file in this repository, stop its dependents, install
+the edited file, reload systemd, start it again, and check its logs.
 
 For the Gemini camera service:
 
 cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
+sudo systemctl stop ceabot-capture.service
+sudo systemctl stop orbbec-camera.service
 sudo cp orbbec-camera.service /etc/systemd/system/
 sudo chmod 644 /etc/systemd/system/orbbec-camera.service
 sudo systemctl daemon-reload
-sudo systemctl restart orbbec-camera.service
+sudo systemctl start orbbec-camera.service
+sudo systemctl start ceabot-capture.service
 journalctl -u orbbec-camera.service -f
 
 For the capture server service:
 
+sudo systemctl stop ceabot-capture.service
 sudo cp ceabot-capture.service /etc/systemd/system/
 sudo chmod 644 /etc/systemd/system/ceabot-capture.service
 sudo systemctl daemon-reload
-sudo systemctl restart ceabot-capture.service
+sudo systemctl start ceabot-capture.service
 journalctl -u ceabot-capture.service -f
 
-8. Disable the automatic services if needed
+9. Disable the automatic services if needed
 --------------------------------------------
 sudo systemctl disable --now ceabot-capture.service
 sudo systemctl disable --now orbbec-camera.service

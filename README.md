@@ -1,4 +1,4 @@
-# Gemini 336 capture spool over the Gen3 expansion Ethernet
+# Gemini 305 capture spool over the Gen3 expansion Ethernet
 
 The Pi captures and compresses every view locally. It does **not** transfer a
 view during the scan. After `/individual_scan_done` is published, the Jetson
@@ -25,6 +25,65 @@ needs one, avoiding duplicate storage and transfer during acquisition.
 Use Ubuntu Server ARM64 and synchronize the Pi and Jetson clocks with
 chrony/NTP. Configure `eth0` as `10.20.0.200/24` and install the Orbbec ROS 2
 wrapper, `cv_bridge`, `message_filters`, OpenCV, NumPy and PyYAML.
+
+## Install or upgrade the Orbbec SDK for Gemini 305
+
+Gemini 305 firmware 1.0.70 requires OrbbecSDK/ROS wrapper 2.8.6 or newer.
+Use the `v2-main` branch. The current driver uses
+`gemini_301_series.launch.py`; the older `gemini305.launch.py` name is not
+present in current releases.
+
+Stop the camera processes and disconnect the camera before rebuilding:
+
+```bash
+sudo systemctl stop ceabot-capture.service orbbec-camera.service
+pkill -f component_container || true
+```
+
+For an upgrade from the old 2.7.6 workspace, keep a recoverable backup and
+build a fresh overlay:
+
+```bash
+cd /home/thiwa
+mv orbbec_ws orbbec_ws_2_7_6_backup
+mkdir -p orbbec_ws/src
+
+source /opt/ros/jazzy/setup.bash
+sudo apt update
+sudo apt install -y git libgflags-dev nlohmann-json3-dev libdw-dev libssl-dev \
+  mesa-utils libgl1 libgoogle-glog-dev ros-jazzy-image-transport \
+  ros-jazzy-image-transport-plugins ros-jazzy-compressed-image-transport \
+  ros-jazzy-image-publisher ros-jazzy-camera-info-manager \
+  ros-jazzy-diagnostic-updater ros-jazzy-diagnostic-msgs \
+  ros-jazzy-statistics-msgs ros-jazzy-xacro ros-jazzy-backward-ros
+
+cd /home/thiwa/orbbec_ws/src
+git clone --branch v2-main --single-branch \
+  https://github.com/orbbec/OrbbecSDK_ROS2.git
+
+cd /home/thiwa/orbbec_ws
+colcon build --event-handlers console_direct+ \
+  --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+cd /home/thiwa/orbbec_ws/src/OrbbecSDK_ROS2/orbbec_camera/scripts
+sudo bash install_udev_rules.sh
+sudo udevadm control --reload-rules
+sudo udevadm trigger
+```
+
+Reconnect the camera after a complete power cycle, then verify that the new
+overlay, device and launch file are available:
+
+```bash
+source /home/thiwa/orbbec_ws/install/setup.bash
+ros2 pkg prefix orbbec_camera
+ros2 pkg xml orbbec_camera | grep '<version>'
+ros2 run orbbec_camera list_devices_node
+ros2 launch orbbec_camera gemini_301_series.launch.py --show-args
+```
+
+The package prefix must be below `/home/thiwa/orbbec_ws/install`, and the
+reported wrapper/SDK version must be 2.8.6 or newer.
 
 ## Verified physical wiring
 
@@ -116,6 +175,43 @@ sudo systemctl enable --now orbbec-camera.service
 sudo systemctl enable --now ceabot-capture.service
 ```
 
+## Safely install updated Pi service files
+
+Stop dependent services before replacing their unit files. Copy the network
+service first, camera service second and capture service last:
+
+```bash
+sudo systemctl stop ceabot-capture.service
+sudo systemctl stop orbbec-camera.service
+sudo systemctl stop ceabot-expansion-network.service
+
+cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
+sudo cp ceabot-expansion-network.service /etc/systemd/system/
+sudo cp orbbec-camera.service /etc/systemd/system/
+sudo cp ceabot-capture.service /etc/systemd/system/
+sudo chmod 644 /etc/systemd/system/ceabot-expansion-network.service \
+  /etc/systemd/system/orbbec-camera.service \
+  /etc/systemd/system/ceabot-capture.service
+
+sudo systemctl daemon-reload
+sudo systemctl reset-failed ceabot-expansion-network.service \
+  orbbec-camera.service ceabot-capture.service
+sudo systemctl enable --now ceabot-expansion-network.service
+sudo systemctl start orbbec-camera.service
+sudo systemctl start ceabot-capture.service
+```
+
+Verify that `eth0` owns `10.20.0.200` before diagnosing capture-server bind
+failures:
+
+```bash
+ip -brief address show eth0
+systemctl --no-pager --full status \
+  ceabot-expansion-network.service orbbec-camera.service ceabot-capture.service
+journalctl -u orbbec-camera.service -n 100 --no-pager
+journalctl -u ceabot-capture.service -n 100 --no-pager
+```
+
 On the Jetson:
 
 ```bash
@@ -150,7 +246,7 @@ The registered colored point-cloud topic is required:
 source /opt/ros/$ROS_DISTRO/setup.bash
 source ~/orbbec_ws/install/setup.bash
 
-ros2 launch orbbec_camera gemini_330_series.launch.py \
+ros2 launch orbbec_camera gemini_301_series.launch.py \
   camera_name:=gemini336 \
   depth_registration:=true \
   align_mode:=SW \
