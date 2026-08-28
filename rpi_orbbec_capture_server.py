@@ -47,7 +47,7 @@ class OrbbecFrameSource(Node):
         color = Subscriber(self, Image, f"{prefix}/color/image_raw")
         depth = Subscriber(self, Image, f"{prefix}/depth/image_raw")
         cloud = Subscriber(self, PointCloud2, f"{prefix}/depth_registered/points")
-        self.sync = ApproximateTimeSynchronizer([color, depth, cloud], queue_size=20, slop=0.15)
+        self.sync = ApproximateTimeSynchronizer([color, depth, cloud], queue_size=3, slop=0.15)
         self.sync.registerCallback(self._frames)
 
     def _color_info(self, message):
