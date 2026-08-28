@@ -7,7 +7,7 @@ Wants=network.target ceabot-expansion-network.service
 Type=simple
 User=thiwa
 Environment=HOME=/home/thiwa
-ExecStart=/bin/bash -lc 'source /home/thiwa/CEAbot_Rpi/systemd_boot_setup/ros_jazzy.bash && exec ros2 launch orbbec_camera gemini_330_series.launch.py camera_name:=gemini336 depth_registration:=true align_mode:=SW enable_point_cloud:=false enable_colored_point_cloud:=true'
+ExecStart=/bin/bash -lc 'source /home/thiwa/CEAbot_Rpi/systemd_boot_setup/ros_jazzy.bash && exec ros2 launch orbbec_camera gemini_301_series.launch.py camera_name:=gemini336 depth_registration:=true align_mode:=SW enable_point_cloud:=false enable_colored_point_cloud:=true color_width:=1280 color_height:=800 color_fps:=15 color_format:=MJPG depth_width:=1280 depth_height:=800 depth_fps:=15 depth_format:=Y16'
 Restart=on-failure
 RestartSec=5
 
