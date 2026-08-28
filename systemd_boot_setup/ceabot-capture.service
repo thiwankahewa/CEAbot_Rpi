@@ -1,7 +1,7 @@
 [Unit]
 Description=CEAbot Orbbec Capture Server
-After=network-online.target ceabot-expansion-network.service orbbec-camera.service
-Wants=network-online.target ceabot-expansion-network.service orbbec-camera.service
+After=network-online.target orbbec-camera.service
+Wants=network-online.target orbbec-camera.service
 
 [Service]
 Type=simple

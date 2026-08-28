@@ -19,10 +19,9 @@ Assumptions
 
 Files included in this folder
 -----------------------------
-- ceabot-expansion-network.service
 - orbbec-camera.service
 - ceabot-capture.service
-- jetson-ceabot-rpi-route.service (install this one on the Jetson)
+- ceabot-expansion-network.service (legacy; NetworkManager now owns eth0)
 - ceabot-capture.env.example
 - ros_jazzy.bash
 - REINSTALL_INSTRUCTIONS.txt
@@ -101,56 +100,155 @@ Stop the dependent services before replacing their unit files:
 
 sudo systemctl stop ceabot-capture.service
 sudo systemctl stop orbbec-camera.service
-sudo systemctl stop ceabot-expansion-network.service
 
 cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
-sudo cp ceabot-expansion-network.service /etc/systemd/system/
 sudo cp orbbec-camera.service /etc/systemd/system/
 sudo cp ceabot-capture.service /etc/systemd/system/
-sudo chmod 644 /etc/systemd/system/ceabot-expansion-network.service
 sudo chmod 644 /etc/systemd/system/orbbec-camera.service
 sudo chmod 644 /etc/systemd/system/ceabot-capture.service
 
 Do not copy files directly into multi-user.target.wants. The systemctl enable
 command below creates the correct symbolic links there.
 
-4. Create the private authentication-token file
-------------------------------------------------
-Generate a token:
+4. Configure the same private token on the Pi and Jetson
+---------------------------------------------------------
+Generate one token on the Pi:
 
 openssl rand -hex 32
 
-Create the file:
+Copy the generated value somewhere private temporarily. On the Pi, create the
+environment file used by ceabot-capture.service:
 
 sudo nano /etc/ceabot-capture.env
 
-Add this line, replacing the example value with the generated token:
+Add this line, replacing the placeholder with the generated value:
 
 CEABOT_CAPTURE_TOKEN=replace_with_the_generated_token
 
-Protect the file:
+Protect the Pi file and restart the capture server if it is already running:
 
 sudo chown root:root /etc/ceabot-capture.env
 sudo chmod 600 /etc/ceabot-capture.env
+sudo systemctl try-restart ceabot-capture.service
 
-Configure the Jetson to use exactly the same token. The example file in this
-folder intentionally does not contain the real secret.
+On the Jetson, store the exact same token in a user-owned private file:
 
-5. Configure the Ethernet address and routes
---------------------------------------------
-The ceabot-expansion-network service forces eth0 to 100 Mbps/full duplex,
-assigns 10.20.0.200/24, and installs the return route through 10.20.0.1.
-Install the Jetson route service separately on the Jetson:
+mkdir -p /home/thiwa/.config/ceabot
+chmod 700 /home/thiwa/.config/ceabot
+nano /home/thiwa/.config/ceabot/capture.env
 
-cd /home/thiwa/CEAbot_Rpi/systemd_boot_setup
-sudo cp jetson-ceabot-rpi-route.service /etc/systemd/system/
-sudo systemctl daemon-reload
-sudo systemctl enable --now jetson-ceabot-rpi-route.service
+Add the same line and value used on the Pi:
 
-On the Pi, confirm that the expansion address is assigned before expecting the
-capture server to start:
+CEABOT_CAPTURE_TOKEN=replace_with_the_same_generated_token
+
+Protect the Jetson file:
+
+chmod 600 /home/thiwa/.config/ceabot/capture.env
+
+Before starting the main ROS launch in each new Jetson shell, export the token:
+
+set -a
+source /home/thiwa/.config/ceabot/capture.env
+set +a
+source /home/thiwa/CEAbot/install/setup.bash
+ros2 launch bench_robot full_robot.launch.py
+
+The main launch passes CEABOT_CAPTURE_TOKEN to remote_orbbec_capture. The two
+files persist across reboot and their token values do not change automatically.
+After reboot, the Pi service loads its file automatically. A manually started
+Jetson launch still needs the source commands above in each new shell.
+
+Do not put the real token in ceabot-capture.env.example, a launch file, source
+code, commands.txt, shell history, or Git. If the token is changed, update both
+devices so their values continue to match.
+
+Test authentication from the Jetson after loading the environment file:
+
+curl -H "Authorization: Bearer $CEABOT_CAPTURE_TOKEN" \
+  http://10.20.0.200:8080/health
+
+5. Persist the Ethernet addresses and routes with NetworkManager
+----------------------------------------------------------------
+NetworkManager already owns these Ethernet interfaces. Configure its existing
+profiles instead of enabling the legacy oneshot network services; otherwise
+NetworkManager can remove addresses and routes after the services exit.
+
+On the Pi, the existing connection is named netplan-eth0. Configure the static
+address, return route, and Kinova expansion-port link settings:
+
+sudo nmcli connection modify netplan-eth0 \
+  ipv4.method manual \
+  ipv4.addresses 10.20.0.200/24 \
+  ipv4.gateway "" \
+  ipv4.routes "192.168.1.0/24 10.20.0.1" \
+  ipv4.never-default yes \
+  ipv6.method link-local \
+  802-3-ethernet.auto-negotiate no \
+  802-3-ethernet.speed 100 \
+  802-3-ethernet.duplex full \
+  connection.autoconnect yes
+
+sudo nmcli connection up netplan-eth0
+
+Verify the Pi before continuing:
 
 ip -brief address show eth0
+ip route get 192.168.1.2
+ping -c 4 10.20.0.1
+
+On the Jetson, find the NetworkManager connection attached to enP1p1s0:
+
+nmcli device status
+nmcli -g GENERAL.CONNECTION device show enP1p1s0
+
+If it reports a connection name such as "Wired connection 1", substitute that
+exact name in these commands:
+
+sudo nmcli connection modify "Wired connection 1" \
+  ipv4.method manual \
+  ipv4.addresses 192.168.1.2/24 \
+  ipv4.gateway "" \
+  ipv4.routes "10.20.0.0/24 192.168.1.10" \
+  ipv4.never-default yes \
+  ipv6.method link-local \
+  connection.autoconnect yes
+
+sudo nmcli connection up "Wired connection 1"
+
+If GENERAL.CONNECTION reports -- instead, create and activate a connection:
+
+sudo nmcli connection add \
+  type ethernet \
+  ifname enP1p1s0 \
+  con-name ceabot-kinova \
+  ipv4.method manual \
+  ipv4.addresses 192.168.1.2/24 \
+  ipv4.routes "10.20.0.0/24 192.168.1.10" \
+  ipv4.never-default yes \
+  ipv6.method link-local \
+  connection.autoconnect yes
+
+sudo nmcli connection up ceabot-kinova
+
+Verify the Jetson:
+
+ip -brief address show enP1p1s0
+ip route get 10.20.0.200
+ping -c 4 192.168.1.10
+ping -c 4 10.20.0.200
+
+Reboot both devices and repeat the address, route, and ping checks. Only after
+the NetworkManager settings survive reboot, disable any previously installed
+legacy network service on the corresponding device:
+
+# Run on the Pi, if this legacy service was installed:
+sudo systemctl disable --now ceabot-expansion-network.service
+
+# Run on the Jetson, if this legacy service was installed:
+sudo systemctl disable --now jetson-ceabot-rpi-route.service
+
+The Pi should retain 10.20.0.200/24 and the Jetson should retain
+192.168.1.2/24. These profiles also persist their cross-network routes.
 
 If the Pi uses a different address, edit ceabot-capture.service and change the
 value after --bind before copying it into /etc/systemd/system.
@@ -161,8 +259,7 @@ For testing on all configured network interfaces, --bind may be changed to
 6. Enable and start all services
 ---------------------------------
 sudo systemctl daemon-reload
-sudo systemctl reset-failed ceabot-expansion-network.service orbbec-camera.service ceabot-capture.service
-sudo systemctl enable --now ceabot-expansion-network.service
+sudo systemctl reset-failed orbbec-camera.service ceabot-capture.service
 sudo systemctl enable orbbec-camera.service ceabot-capture.service
 sudo systemctl start orbbec-camera.service
 sudo systemctl start ceabot-capture.service
@@ -175,9 +272,9 @@ systemctl status ceabot-capture.service
 journalctl -u orbbec-camera.service -f
 journalctl -u ceabot-capture.service -f
 
-Test the HTTP server locally:
+Test the authenticated HTTP server locally on the Pi:
 
-curl http://10.20.0.200:8080/health
+sudo bash -c 'set -a; source /etc/ceabot-capture.env; curl -H "Authorization: Bearer $CEABOT_CAPTURE_TOKEN" http://10.20.0.200:8080/health'
 
 8. Restart after editing a service
 ----------------------------------

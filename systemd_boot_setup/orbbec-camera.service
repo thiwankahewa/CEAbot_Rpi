@@ -1,7 +1,7 @@
 [Unit]
 Description=Orbbec Gemini 330 ROS 2 Camera
-After=network.target ceabot-expansion-network.service
-Wants=network.target ceabot-expansion-network.service
+After=network.target
+Wants=network.target
 
 [Service]
 Type=simple
