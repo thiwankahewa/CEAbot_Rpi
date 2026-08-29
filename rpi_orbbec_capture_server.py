@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Pi-side Gemini 336 capture spool with resumable batch downloads."""
 
-import argparse
 import hashlib
 import hmac
 import json
@@ -28,20 +27,32 @@ from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
 from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from std_srvs.srv import SetBool
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
+BIND_ADDRESS = "10.20.0.200"
+PORT = 8080
+CAMERA_NAME = "gemini336"
+CAPTURE_TIMEOUT_SEC = 15.0
+STREAM_CONTROL_TIMEOUT_SEC = 15.0
+STREAM_WARMUP_SEC = 1.0
+SPOOL_DIR = "/var/lib/ceabot-captures"
+DEPTH_SCALE_M_PER_UNIT = 0.001
+AUTH_TOKEN = os.environ.get("CEABOT_CAPTURE_TOKEN", "")
 
 
 class OrbbecFrameSource(Node):
-    def __init__(self, camera_name="gemini336"):
+    def __init__(self):
         super().__init__("rpi_orbbec_capture_server")
-        prefix = f"/{camera_name}"
+        prefix = f"/{CAMERA_NAME}"
         self.bridge = CvBridge()
         self.condition = threading.Condition()
         self.sequence = 0
         self.latest_set = None
         self.color_info = None
         self.depth_info = None
+        self.streams_enabled = None
+        self.streams_client = self.create_client( SetBool, f"{prefix}/set_streams_enable")
         self.create_subscription(CameraInfo, f"{prefix}/color/camera_info", self._color_info, 10)
         self.create_subscription(CameraInfo, f"{prefix}/depth/camera_info", self._depth_info, 10)
         color = Subscriber(self, Image, f"{prefix}/color/image_raw")
@@ -49,6 +60,25 @@ class OrbbecFrameSource(Node):
         cloud = Subscriber(self, PointCloud2, f"{prefix}/depth_registered/points")
         self.sync = ApproximateTimeSynchronizer([color, depth, cloud], queue_size=3, slop=0.15)
         self.sync.registerCallback(self._frames)
+
+    def set_streams_enabled(self, enabled, timeout=STREAM_CONTROL_TIMEOUT_SEC):
+        if not self.streams_client.wait_for_service(timeout_sec=timeout):
+            raise TimeoutError("Orbbec set_streams_enable service is unavailable")
+        request = SetBool.Request()
+        request.data = bool(enabled)
+        future = self.streams_client.call_async(request)
+        deadline = time.monotonic() + timeout
+        while not future.done():
+            if time.monotonic() >= deadline:
+                future.cancel()
+                raise TimeoutError( f"Timed out turning Orbbec streams {'on' if enabled else 'off'}")
+            time.sleep(0.01)
+        response = future.result()
+        if response is None or not response.success:
+            message = response.message if response is not None else "no response"
+            raise RuntimeError( f"Could not turn Orbbec streams {'on' if enabled else 'off'}: {message}" )
+        self.streams_enabled = bool(enabled)
+        self.get_logger().info( f"Orbbec streams {'enabled' if enabled else 'disabled'}: {response.message}")
 
     def _color_info(self, message):
         self.color_info = message
@@ -141,7 +171,15 @@ def build_spooled_capture(server, request):
         raise ValueError("run_id/view_label contains unsupported characters")
     if plant_id < 0:
         raise ValueError("plant_id must be non-negative")
-    color, depth, color_msg, depth_msg, cloud_msg, received_ns = server.frame_source.capture_next(server.capture_timeout)
+    server.frame_source.set_streams_enabled(True)
+    try:
+        time.sleep(STREAM_WARMUP_SEC)
+        color, depth, color_msg, depth_msg, cloud_msg, received_ns = (server.frame_source.capture_next(server.capture_timeout))
+    finally:
+        try:
+            server.frame_source.set_streams_enabled(False)
+        except Exception as exc:
+            server.frame_source.get_logger().error(f"Failed to disable Orbbec streams after capture: {exc}")
     xyzrgb = pointcloud_xyzrgb(cloud_msg)
     archive_id = uuid.uuid4().hex
     run_spool = os.path.join(server.spool_dir, run_id)
@@ -212,7 +250,11 @@ class CaptureHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         try:
             if parsed.path == "/health":
-                self._json_reply(200, {"ok": True, "frames_received": self.server.frame_source.sequence}); return
+                self._json_reply(200, {
+                    "ok": True,
+                    "frames_received": self.server.frame_source.sequence,
+                    "streams_enabled": self.server.frame_source.streams_enabled,
+                }); return
             query = parse_qs(parsed.query)
             if parsed.path == "/manifest":
                 self._json_reply(200, {"archives": self._manifest(query["run_id"][0])}); return
@@ -303,21 +345,11 @@ class CaptureHandler(BaseHTTPRequestHandler):
         self.server.frame_source.get_logger().info(format_string % args)
 
 
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--bind", default="10.20.0.200")
-    parser.add_argument("--port", type=int, default=8080)
-    parser.add_argument("--camera-name", default="gemini336")
-    parser.add_argument("--capture-timeout", type=float, default=15.0)
-    parser.add_argument("--spool-dir", default="/var/lib/ceabot-captures")
-    parser.add_argument("--depth-scale-m-per-unit", type=float, default=0.001)
-    parser.add_argument("--token", default=os.environ.get("CEABOT_CAPTURE_TOKEN", ""))
-    return parser.parse_args()
-
-
 def main():
-    args = parse_args(); os.makedirs(args.spool_dir, exist_ok=True); rclpy.init()
-    source = OrbbecFrameSource(args.camera_name)
+    os.makedirs(SPOOL_DIR, exist_ok=True)
+    rclpy.init()
+    source = OrbbecFrameSource()
+
     def spin_ros():
         try:
             rclpy.spin(source)
@@ -325,12 +357,17 @@ def main():
             pass
 
     ros_thread = threading.Thread(target=spin_ros, daemon=True); ros_thread.start()
-    server = ThreadingHTTPServer((args.bind, args.port), CaptureHandler)
-    server.frame_source, server.capture_timeout = source, args.capture_timeout
+    try:
+        source.set_streams_enabled(False)
+    except Exception as exc:
+        source.get_logger().warning( f"Could not disable Orbbec streams at startup; continuing: {exc}")
+    server = ThreadingHTTPServer((BIND_ADDRESS, PORT), CaptureHandler)
+    server.frame_source, server.capture_timeout = source, CAPTURE_TIMEOUT_SEC
     server.capture_lock = threading.Lock()
-    server.depth_scale_m, server.spool_dir = args.depth_scale_m_per_unit, os.path.abspath(args.spool_dir)
-    server.auth_token = args.token
-    source.get_logger().info(f"Listening on http://{args.bind}:{args.port}; spool={server.spool_dir}")
+    server.depth_scale_m = DEPTH_SCALE_M_PER_UNIT
+    server.spool_dir = os.path.abspath(SPOOL_DIR)
+    server.auth_token = AUTH_TOKEN
+    source.get_logger().info(f"Listening on http://{BIND_ADDRESS}:{PORT}; spool={server.spool_dir}")
     stop_requested = threading.Event()
 
     def request_stop(signum, frame):

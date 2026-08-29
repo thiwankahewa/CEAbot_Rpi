@@ -364,17 +364,24 @@ journalctl -u orbbec-camera.service -n 100 --no-pager
 journalctl -u ceabot-capture.service -n 100 --no-pager
 ros2 node list
 ros2 topic list | grep /gemini336
-timeout 10 ros2 topic hz /gemini336/depth/image_raw
 ```
 
-Do not run a foreground Orbbec launch while its service is active. Two drivers
-cause `uvc_open failed ... Return Code: -6`.
-
-Authenticated local health test:
+The capture server turns all configured Gemini streams off after startup to
+reduce idle CPU and USB load. Therefore, topics remain listed but `ros2 topic
+hz` receives no frames while the system is idle; this is expected. Check the
+server state instead:
 
 ```bash
 sudo bash -c 'set -a; source /etc/ceabot-capture.env; curl -H "Authorization: Bearer $CEABOT_CAPTURE_TOKEN" http://10.20.0.200:8080/health'
 ```
+
+An idle response reports `"streams_enabled": false`. Each authenticated
+capture request enables the streams, waits one second for exposure and
+synchronization, captures the next RGB/depth/registered-cloud set, and disables
+the streams again before image conversion, compression and transfer.
+
+Do not run a foreground Orbbec launch while its service is active. Two drivers
+cause `uvc_open failed ... Return Code: -6`.
 
 ## 10. Jetson proxy and end-to-end test
 
@@ -446,7 +453,8 @@ sudo journalctl -u ceabot-capture.service -b --no-pager -l
 sudo ss -ltnp | grep 8080
 ```
 
-If topics exist but publish no frames:
+If topics exist but a capture request times out, isolate the camera driver from
+the capture server and test a continuously enabled stream:
 
 ```bash
 sudo systemctl stop ceabot-capture.service
