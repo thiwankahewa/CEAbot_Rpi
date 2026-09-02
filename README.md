@@ -14,7 +14,6 @@ download at its current chunk and transfer resumes afterward.
 <run_dir>/plant_<ID>/<view>/
 ├── color.png
 ├── depth.npy
-├── cloud_xyzrgb.npy
 └── meta.yaml
 ```
 
@@ -377,7 +376,7 @@ sudo bash -c 'set -a; source /etc/ceabot-capture.env; curl -H "Authorization: Be
 
 An idle response reports `"streams_enabled": false`. Each authenticated
 capture request enables the streams, waits one second for exposure and
-synchronization, captures the next RGB/depth/registered-cloud set, and disables
+synchronization, captures the next RGB/depth pair, and disables
 the streams again before image conversion, compression and transfer.
 
 Do not run a foreground Orbbec launch while its service is active. Two drivers
@@ -426,7 +425,7 @@ grep remote_archive_pending \
   /home/thiwa/scan_data/stationary_rpi_test/plant_01/stationary_01/meta.yaml
 ```
 
-Expected: `color.png`, `depth.npy`, `cloud_xyzrgb.npy`, `meta.yaml`, and
+Expected: `color.png`, `depth.npy`, `meta.yaml`, and
 `remote_archive_pending: false`.
 
 ## 11. Updating and troubleshooting

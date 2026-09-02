@@ -24,7 +24,7 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 from rclpy.node import Node
 from rclpy.executors import ExternalShutdownException
-from sensor_msgs.msg import CameraInfo, Image, PointCloud2
+from sensor_msgs.msg import CameraInfo, Image
 from std_srvs.srv import SetBool
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.-]{1,128}$")
@@ -55,8 +55,7 @@ class OrbbecFrameSource(Node):
         self.create_subscription(CameraInfo, f"{prefix}/depth/camera_info", self._depth_info, 10)
         color = Subscriber(self, Image, f"{prefix}/color/image_raw")
         depth = Subscriber(self, Image, f"{prefix}/depth/image_raw")
-        cloud = Subscriber(self, PointCloud2, f"{prefix}/depth_registered/points")
-        self.sync = ApproximateTimeSynchronizer([color, depth, cloud], queue_size=3, slop=0.15)
+        self.sync = ApproximateTimeSynchronizer([color, depth], queue_size=3, slop=0.15)
         self.sync.registerCallback(self._frames)
 
     def set_streams_enabled(self, enabled, timeout=STREAM_CONTROL_TIMEOUT_SEC):
@@ -84,10 +83,10 @@ class OrbbecFrameSource(Node):
     def _depth_info(self, message):
         self.depth_info = message
 
-    def _frames(self, color, depth, cloud):
+    def _frames(self, color, depth):
         with self.condition:
             self.sequence += 1
-            self.latest_set = (self.sequence, color, depth, cloud, time.monotonic_ns())
+            self.latest_set = (self.sequence, color, depth)
             self.condition.notify_all()
 
     def capture_next(self, timeout):
@@ -97,14 +96,14 @@ class OrbbecFrameSource(Node):
             while self.sequence <= initial:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
-                    raise TimeoutError("No synchronized RGB/depth/registered-cloud set received")
+                    raise TimeoutError("No synchronized RGB/depth frame pair received")
                 self.condition.wait(remaining)
-            _, color_msg, depth_msg, cloud_msg, received_ns = self.latest_set
+            _, color_msg, depth_msg = self.latest_set
         color = self.bridge.imgmsg_to_cv2(color_msg, desired_encoding="bgr8")
         depth = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding="passthrough")
         if depth.dtype != np.uint16:
             raise ValueError(f"Expected uint16 depth, received {depth.dtype}")
-        return color, depth, color_msg, depth_msg, cloud_msg, received_ns
+        return color, depth, color_msg, depth_msg
 
 
 def stamp_dict(stamp):
@@ -121,31 +120,6 @@ def camera_info_dict(message):
         "d": [float(value) for value in message.d],
         "k": [float(value) for value in message.k],
     }
-
-
-def pointcloud_xyzrgb(message):
-    fields = {field.name: field for field in message.fields}
-    if not all(name in fields for name in ("x", "y", "z")):
-        raise ValueError("Point cloud is missing x, y, or z")
-    rgb_name = "rgb" if "rgb" in fields else "rgba" if "rgba" in fields else None
-    if rgb_name is None:
-        raise ValueError("Registered point cloud has no rgb/rgba field")
-    endian = ">" if message.is_bigendian else "<"
-    names = ["x", "y", "z", rgb_name]
-    dtype = np.dtype({
-        "names": names,
-        "formats": [endian + "f4", endian + "f4", endian + "f4", endian + "u4"],
-        "offsets": [fields[name].offset for name in names],
-        "itemsize": message.point_step,
-    })
-    points = np.frombuffer(message.data, dtype=dtype, count=message.width * message.height)
-    valid = np.isfinite(points["x"]) & np.isfinite(points["y"]) & np.isfinite(points["z"])
-    points = points[valid]
-    packed = points[rgb_name].astype(np.uint32, copy=False)
-    red = ((packed >> 16) & 0xFF).astype(np.float32)
-    green = ((packed >> 8) & 0xFF).astype(np.float32)
-    blue = (packed & 0xFF).astype(np.float32)
-    return np.column_stack((points["x"], points["y"], points["z"], red, green, blue)).astype(np.float32, copy=False)
 
 
 def sha256_file(path):
@@ -173,15 +147,12 @@ def build_spooled_capture(server, request):
     server.frame_source.set_streams_enabled(True)
     try:
         time.sleep(STREAM_WARMUP_SEC)
-        color, depth, _color_msg, _depth_msg, cloud_msg, _received_ns = (
-            server.frame_source.capture_next(server.capture_timeout)
-        )
+        color, depth, _color_msg, depth_msg = server.frame_source.capture_next( server.capture_timeout)
     finally:
         try:
             server.frame_source.set_streams_enabled(False)
         except Exception as exc:
             server.frame_source.get_logger().error(f"Failed to disable Orbbec streams after capture: {exc}")
-    xyzrgb = pointcloud_xyzrgb(cloud_msg)
     archive_id = uuid.uuid4().hex
     run_spool = os.path.join(server.spool_dir, run_id)
     os.makedirs(run_spool, exist_ok=True)
@@ -190,20 +161,16 @@ def build_spooled_capture(server, request):
 
     with tempfile.TemporaryDirectory(prefix="capture_", dir=run_spool) as directory:
         paths = {name: os.path.join(directory, name) for name in (
-            "color.png", "depth.npy", "cloud_xyzrgb.npy", "meta.yaml"
+            "color.png", "depth.npy", "meta.yaml"
         )}
         if not cv2.imwrite(paths["color.png"], color, [cv2.IMWRITE_PNG_COMPRESSION, 3]):
             raise IOError("Failed to encode color.png")
         np.save(paths["depth.npy"], depth)
-        np.save(paths["cloud_xyzrgb.npy"], xyzrgb)
         metadata = {
             "plant_id": plant_id, "view_label": view_label,
             "capture_utc": datetime.now(timezone.utc).isoformat(),
-            "received_monotonic_ns": int(received_ns),
-            "color_timestamp": stamp_dict(color_msg.header.stamp),
-            "depth_timestamp": stamp_dict(depth_msg.header.stamp),
-            "cloud_timestamp": stamp_dict(cloud_msg.header.stamp),
-            "frame_id": cloud_msg.header.frame_id,
+            "capture_timestamp": stamp_dict(depth_msg.header.stamp),
+            "camera_frame": depth_msg.header.frame_id,
             "depth_scale_m_per_unit": float(server.depth_scale_m),
             "color_camera_info": camera_info_dict(server.frame_source.color_info),
             "depth_camera_info": camera_info_dict(server.frame_source.depth_info),
