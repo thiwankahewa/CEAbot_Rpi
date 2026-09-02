@@ -5,10 +5,8 @@ import hashlib
 import hmac
 import json
 import os
-import platform
 import re
 import signal
-import socket
 import tarfile
 import tempfile
 import threading
@@ -115,12 +113,13 @@ def stamp_dict(stamp):
 
 def camera_info_dict(message):
     if message is None:
-        return None
+        raise RuntimeError("Camera calibration is unavailable")
     return {
-        "frame_id": message.header.frame_id, "width": int(message.width),
-        "height": int(message.height), "distortion_model": message.distortion_model,
-        "d": [float(v) for v in message.d], "k": [float(v) for v in message.k],
-        "r": [float(v) for v in message.r], "p": [float(v) for v in message.p],
+        "width": int(message.width),
+        "height": int(message.height),
+        "distortion_model": message.distortion_model,
+        "d": [float(value) for value in message.d],
+        "k": [float(value) for value in message.k],
     }
 
 
@@ -174,7 +173,9 @@ def build_spooled_capture(server, request):
     server.frame_source.set_streams_enabled(True)
     try:
         time.sleep(STREAM_WARMUP_SEC)
-        color, depth, color_msg, depth_msg, cloud_msg, received_ns = (server.frame_source.capture_next(server.capture_timeout))
+        color, depth, _color_msg, _depth_msg, cloud_msg, _received_ns = (
+            server.frame_source.capture_next(server.capture_timeout)
+        )
     finally:
         try:
             server.frame_source.set_streams_enabled(False)
@@ -196,7 +197,6 @@ def build_spooled_capture(server, request):
         np.save(paths["depth.npy"], depth)
         np.save(paths["cloud_xyzrgb.npy"], xyzrgb)
         metadata = {
-            "schema_version": 2, "run_id": run_id, "archive_id": archive_id,
             "plant_id": plant_id, "view_label": view_label,
             "capture_utc": datetime.now(timezone.utc).isoformat(),
             "received_monotonic_ns": int(received_ns),
@@ -204,20 +204,9 @@ def build_spooled_capture(server, request):
             "depth_timestamp": stamp_dict(depth_msg.header.stamp),
             "cloud_timestamp": stamp_dict(cloud_msg.header.stamp),
             "frame_id": cloud_msg.header.frame_id,
-            "color_frame_id": color_msg.header.frame_id,
-            "depth_frame_id": depth_msg.header.frame_id,
-            "color_encoding": color_msg.encoding, "depth_encoding": depth_msg.encoding,
-            "color_shape": list(color.shape), "depth_shape": list(depth.shape),
-            "depth_dtype": str(depth.dtype),
             "depth_scale_m_per_unit": float(server.depth_scale_m),
-            "cloud_xyzrgb_point_count": int(len(xyzrgb)),
             "color_camera_info": camera_info_dict(server.frame_source.color_info),
             "depth_camera_info": camera_info_dict(server.frame_source.depth_info),
-            "host": socket.gethostname(), "platform": platform.platform(),
-        }
-        metadata["files"] = {
-            name: {"bytes": os.path.getsize(path), "sha256": sha256_file(path)}
-            for name, path in paths.items() if name != "meta.yaml"
         }
         with open(paths["meta.yaml"], "w", encoding="utf-8") as output:
             yaml.safe_dump(metadata, output, sort_keys=False)
